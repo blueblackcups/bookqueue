@@ -1,0 +1,16 @@
+# Environment variables
+.env
+
+# Persistence file
+bot_persistence.pickle
+
+# Database file
+queue.db
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+.venv/
