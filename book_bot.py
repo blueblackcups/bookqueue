@@ -15,7 +15,8 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     ContextTypes, filters, ConversationHandler, CallbackQueryHandler, PicklePersistence
 )
-from keep_alive import keep_alive
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 
 # ---------- Load Environment Variables ----------
 load_dotenv()
@@ -732,6 +733,18 @@ async def auto_post_loop(app):
 # ---------- Main ----------
 import nest_asyncio
 
+def start_http_server(port=8080):
+    class HealthCheckHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'OK')
+    
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    return server
+
 async def main():
     init_db()
 
@@ -777,32 +790,17 @@ async def main():
     asyncio.create_task(auto_post_loop(application))
     await application.run_polling()
 
-def start_http_server(port=5000):
-    """Start a simple HTTP server to satisfy Railway's requirements"""
-    from http.server import HTTPServer, BaseHTTPRequestHandler
-    import threading
-
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b'Telegram bot is running!')
-
-    server = HTTPServer(('0.0.0.0', port), Handler)
-    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
-    server_thread.start()
-    return server
-
 if __name__ == '__main__':
     try:
-        # Start the keep-alive server
-        keep_alive()
+        # Start HTTP server for health checks
+        port = int(os.environ.get('PORT', 8080))
+        start_http_server(port)
         
         # Initialize the bot
         nest_asyncio.apply()
         
         # Run the bot
-        print("Starting bot...")
+        print(f"Starting bot on port {port}...")
         asyncio.get_event_loop().run_until_complete(main())
         
     except Exception as e:
