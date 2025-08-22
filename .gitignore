@@ -14,3 +14,9 @@ __pycache__/
 # Virtual environment
 venv/
 .venv/
+
+*.py[cod]
+*$py.class
+*.db
+*.pickle
+.DS_Store
