@@ -105,16 +105,18 @@ async def extract_quotes_from_text(prompt):
         logging.error(f"Error from Groq API: {e}")
         return f"❌ Error from Groq API: {e}"
 
-# ---------- Global User State ----------
-user_state = {}
-
 # ---------- Start & Help Commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("➕ Add a Book", callback_data="addbook_start")],
+        [InlineKeyboardButton("რი Queue", callback_data="queue_show"), InlineKeyboardButton("❓ Help", callback_data="help_show")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
         "Welcome! I'm your personal Book Quote Bot. 📚\n\n"
         "I can find a book online, extract memorable quotes, and post them to your channel.\n\n"
-        "To get started, use the /addbook command.",
-        reply_markup=MAIN_KEYBOARD_MARKUP
+        "To get started, use the /addbook command or press the button below.",
+        reply_markup=reply_markup
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -141,16 +143,15 @@ async def get_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     lang = query.data.split('_')[1]
-    chat_id = update.effective_chat.id
-    user_state[chat_id]['language'] = lang
+    context.user_data['book_info'] = {'language': lang}
     
     await query.edit_message_text(f"✅ Language set to {lang.capitalize()}. Now, what is the book's title?")
     
     return GET_TITLE
 
 async def addbook(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user_state[chat_id] = {}
+    context.user_data.clear() # Start fresh
+    context.user_data['book_info'] = {}
     
     keyboard = [
         [InlineKeyboardButton("🇮🇷 Persian", callback_data="lang_persian"),
@@ -165,30 +166,26 @@ async def addbook(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return GET_LANGUAGE
 
 async def get_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_state[update.effective_chat.id]["title"] = update.message.text
-    reply_keyboard = [["Cancel"]]
+    context.user_data['book_info']["title"] = update.message.text
     await update.message.reply_text(
         "Now send me the author's name:",
-        reply_markup=ReplyKeyboardMarkup(
-            reply_keyboard, one_time_keyboard=True, resize_keyboard=True
-        ),
+        reply_markup=ReplyKeyboardRemove()
     )
     return GET_AUTHOR
 
 async def get_author(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    user_info = user_state.get(chat_id, {})
-    user_info["author"] = update.message.text
-    language = user_info.get('language')
+    book_info = context.user_data.get('book_info', {})
+    book_info["author"] = update.message.text
+    language = book_info.get('language')
 
     await update.message.reply_text(
-        f"✅ Got it: '{user_info['title']}' by {user_info['author']}.",
+        f"✅ Got it: '{book_info['title']}' by {book_info['author']}.",
         reply_markup=ReplyKeyboardRemove(),
     )
 
     if language == 'english':
         await update.message.reply_text("Searching online for the book...")
-        query = f'"{user_info["title"]}" "{user_info["author"]}" filetype:pdf'
+        query = f'"{book_info["title"]}" "{book_info["author"]}" filetype:pdf'
         logging.info(f"Starting book search for query: {query}")
         try:
             search_params = {
@@ -196,31 +193,31 @@ async def get_author(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "q": query,
                 "engine": "google",
             }
-            search_client = GoogleSearch(search_params)
-            search_results = await asyncio.to_thread(search_client.get_dict)
-            pdf_url = next((result.get('link') for result in search_results.get('organic_results', []) if result.get('link', '').endswith('.pdf')), None)
+            async with httpx.AsyncClient() as client:
+                response = await client.post('https://google.serper.dev/search', json=search_params, timeout=20.0)
+                response.raise_for_status()
+                search_results = response.json()
+            
+            pdf_url = next((result.get('link') for result in search_results.get('organic', []) if result.get('link', '').endswith('.pdf')), None)
 
             if pdf_url:
                 await update.message.reply_text(f"Found a PDF online! Downloading from {pdf_url}...")
-                file_path = f"{chat_id}_downloaded_book.pdf"
-                async with httpx.AsyncClient() as client:
-                    response = await client.get(pdf_url, follow_redirects=True, timeout=30.0)
-                    response.raise_for_status()
+                file_path = f"{update.effective_chat.id}_downloaded_book.pdf"
+                async with httpx.AsyncClient(timeout=45.0) as client:
+                    pdf_response = await client.get(pdf_url, follow_redirects=True)
+                    pdf_response.raise_for_status()
                     with open(file_path, "wb") as f:
-                        f.write(response.content)
+                        f.write(pdf_response.content)
                 return await process_book_and_get_quotes(update, context, file_path)
             else:
-                reply_keyboard = [["Cancel"]]
                 await update.message.reply_text(
                     "I couldn't find a PDF online. Please upload the book manually.",
-                    reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True),
                 )
                 return WAITING_PDF
         except Exception as e:
-            logging.error(f"Error during book search or download for '{user_info['title']}' by '{user_info['author']}': {e}", exc_info=True)
+            logging.error(f"Error during book search or download for '{book_info['title']}': {e}", exc_info=True)
             await update.message.reply_text(
                 "An error occurred while searching. Please upload the PDF manually.",
-                reply_markup=ReplyKeyboardMarkup([["Cancel"]], one_time_keyboard=True, resize_keyboard=True),
             )
             return WAITING_PDF
     
@@ -232,9 +229,9 @@ async def get_author(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- Persian Book Reflection Flow ----------
 async def generate_persian_reflection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    user_info = user_state.get(chat_id, {})
-    title = user_info.get('title')
-    author = user_info.get('author')
+    book_info = context.user_data.get('book_info', {})
+    title = book_info.get('title')
+    author = book_info.get('author')
 
     await context.bot.send_message(
         chat_id=chat_id,
@@ -279,7 +276,6 @@ async def generate_persian_reflection(update: Update, context: ContextTypes.DEFA
     )
 
     return AWAIT_QUOTE_APPROVAL
-
 
 # ---------- Quote Generation and Approval Flow ----------
 async def rerun_quote_extraction(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -415,7 +411,6 @@ async def receive_edited_quotes(update: Update, context: ContextTypes.DEFAULT_TY
     
     return AWAIT_QUOTE_APPROVAL
 
-
 # ---------- Manual PDF Handling ----------
 async def handle_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -509,7 +504,6 @@ async def handle_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE
         await query.edit_message_text("Operation cancelled.")
         return ConversationHandler.END
 
-
 # ---------- Process Book and Get Quotes ----------
 async def process_book_and_get_quotes(update: Update, context: ContextTypes.DEFAULT_TYPE, file_path: str):
     chat_id = update.effective_chat.id
@@ -531,17 +525,17 @@ async def process_book_and_get_quotes(update: Update, context: ContextTypes.DEFA
         quotes_raw = await extract_quotes_from_text(prompt)
         quotes = [q.strip() for q in quotes_raw.split('\n') if q.strip()]
 
-        user = user_state.get(chat_id)
-        if not user:
-            await update.message.reply_text("Please start with /addbook first.")
+        book_info = context.user_data.get('book_info')
+        if not book_info or 'title' not in book_info or 'author' not in book_info:
+            await update.message.reply_text("Something went wrong, my apologies. Please start over with /addbook.")
             return ConversationHandler.END
 
         book = {
             "chat_id": chat_id,
-            "title": user["title"],
-            "author": user["author"],
+            "title": book_info["title"],
+            "author": book_info["author"],
             "quotes": quotes,
-            "mode": user.get("mode", "auto"),
+            "mode": 'english_quotes',
             "scheduled_time": None
         }
         context.user_data['pending_book'] = book
@@ -614,8 +608,6 @@ async def confirm_action_handler(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text(f"❌ Posting error: {e}")
         return ConversationHandler.END
 
-
-
 # ---------- Receive Schedule Time ----------
 async def receive_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     time_str = update.message.text
@@ -634,35 +626,27 @@ async def receive_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Cancel Handler ----------
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancels and ends the conversation."""
-    chat_id = update.effective_chat.id
+    """Cancels and ends the conversation, cleaning up user data."""
     query = update.callback_query
     message = update.message
 
-    # Clean up state
-    if chat_id in user_state:
-        del user_state[chat_id]
-    if 'pending_book' in context.user_data:
-        del context.user_data['pending_book']
+    context.user_data.clear()
 
     cancel_message = "Action canceled. What would you like me to do next?"
+    
     if query:
         await query.answer()
         await query.edit_message_text(text="Action canceled.")
-        # Send a new message to show the reply keyboard
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=cancel_message,
-            reply_markup=MAIN_KEYBOARD_MARKUP
-        )
     elif message:
         await message.reply_text(
-            cancel_message,
-            reply_markup=MAIN_KEYBOARD_MARKUP,
+            "Action canceled.",
+            reply_markup=ReplyKeyboardRemove()
         )
+    
+    # Follow up with the main menu
+    await start(update, context)
 
     return ConversationHandler.END
-
 
 # ---------- Queue Management Commands ----------
 async def show_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -679,54 +663,80 @@ async def show_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 async def remove_from_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        index = int(context.args[0])
-        delete_from_queue(index)
-        await update.message.reply_text(f"❌ Removed book with ID {index} from queue.")
-    except:
+    if not context.args:
         await update.message.reply_text("⚠️ Usage: /remove [id]")
+        return
+
+    try:
+        book_id_to_remove = int(context.args[0])
+        delete_from_queue(book_id_to_remove)
+        await update.message.reply_text(f"❌ Removed book with ID {book_id_to_remove} from queue.")
+    except (ValueError, IndexError):
+        await update.message.reply_text("⚠️ Invalid ID. Please provide a valid number from the /queue list.")
 
 # ---------- Post Now Command ----------
 async def post_book_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("⚠️ Usage: /postnow [id]")
+        return
+
     try:
         book_id = int(context.args[0])
         with sqlite3.connect(DB_FILE) as conn:
-            cursor = conn.execute("SELECT title, author, quotes FROM queue WHERE id = ?", (book_id,))
+            cursor = conn.execute("SELECT title, author, quotes, mode FROM queue WHERE id = ?", (book_id,))
             row = cursor.fetchone()
-            if not row:
-                await update.message.reply_text("❌ Book not found.")
-                return
-            title, author, quotes_json = row
-            quotes = json.loads(quotes_json)                                                             
-            message = f"📘 *{title}*\n✍️ _{author}_\n\n"
-            message += '\n'.join([f"🔹 {q}" for q in quotes])
+        
+        if not row:
+            await update.message.reply_text("❌ Book not found.")
+            return
 
-            await context.bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode='Markdown')
+        title, author, quotes_json, mode = row
+        quotes = json.loads(quotes_json)
+        
+        book_data = {
+            'title': title,
+            'author': author,
+            'quotes': quotes,
+            'mode': mode
+        }
+
+        success = await post_book(context, book_data)
+        if success:
             mark_posted(book_id)
             await update.message.reply_text("✅ Book posted now!")
-    except:
-        await update.message.reply_text("⚠️ Usage: /postnow [id]")
+        else:
+            await update.message.reply_text("❌ Failed to post the book. Please check the logs.")
+
+    except (ValueError, IndexError):
+        await update.message.reply_text("⚠️ Invalid ID. Please provide a valid number from the /queue list.")
 
 # ---------- Auto Posting Loop ----------
 async def auto_post_loop(app):
     while True:
-        now = datetime.datetime.now().isoformat()
+        now = datetime.datetime.now()
         with sqlite3.connect(DB_FILE) as conn:
             cursor = conn.execute(
-                "SELECT id, title, author, quotes FROM queue WHERE mode = 'auto' AND posted = 0 AND scheduled_time <= ?", (now,))
+                "SELECT id, title, author, quotes, mode FROM queue WHERE posted = 0 AND scheduled_time IS NOT NULL"
+            )
             for row in cursor.fetchall():
-                book_id, title, author, quotes_json = row
-                quotes = json.loads(quotes_json)
+                book_id, title, author, quotes_json, mode = row
+                scheduled_time = datetime.datetime.fromisoformat(conn.execute("SELECT scheduled_time FROM queue WHERE id = ?", (book_id,)).fetchone()[0])
+                
+                if now >= scheduled_time:
+                    quotes = json.loads(quotes_json)
+                    book_data = {
+                        'title': title,
+                        'author': author,
+                        'quotes': quotes,
+                        'mode': mode
+                    }
+                    logging.info(f"Auto-posting scheduled book ID: {book_id}")
+                    success = await post_book(app, book_data)
+                    if success:
+                        mark_posted(book_id)
+                    else:
+                        logging.error(f"Auto-posting failed for book ID: {book_id}")
 
-                message = f"📘 *{title}*\n✍️ _{author}_\n\n"
-                message += '\n'.join([f"🔹 {q}" for q in quotes])
-                try:
-                    await app.bot.send_message(chat_id=CHANNEL_ID, text=message, parse_mode='Markdown')
-                    mark_posted(book_id)
-                except telegram.error.TimedOut:
-                    logging.warning(f"Timeout error when posting book {book_id}. Retrying next cycle.")
-                except Exception as e:
-                    logging.error(f"Error posting book {book_id}: {e}")
         await asyncio.sleep(60)
 
 # ---------- Main ----------
@@ -744,8 +754,8 @@ async def main():
         .build()
     )
 
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler('addbook', addbook)],
+    add_book_conv = ConversationHandler(
+        entry_points=[CommandHandler('addbook', addbook), CallbackQueryHandler(addbook, pattern='^addbook_start$')],
         states={
             GET_LANGUAGE: [CallbackQueryHandler(get_language, pattern='^lang_')],
             GET_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_title)],
@@ -761,17 +771,21 @@ async def main():
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
-            MessageHandler(filters.Regex(r'(?i)^cancel$'), cancel),
             CallbackQueryHandler(cancel, pattern=r"^cancel$")
         ],
-        per_message=False,
+        per_user=True,
+        per_chat=True,
+        name="add_book_conversation"
     )
 
-    application.add_handler(conv_handler)
+    application.add_handler(add_book_conv)
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("queue", show_queue))
-    application.add_handler(CommandHandler("remove", remove_from_queue))
-    application.add_handler(CommandHandler("postnow", post_book_now))
+    application.add_handler(CallbackQueryHandler(show_queue, pattern='^queue_show$'))
+    application.add_handler(CommandHandler("remove", remove_from_queue, block=False))
+    application.add_handler(CommandHandler("postnow", post_book_now, block=False))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CallbackQueryHandler(help_command, pattern='^help_show$'))
 
     print("Bot is running...")
     asyncio.create_task(auto_post_loop(application))
